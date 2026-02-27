@@ -1,0 +1,7 @@
+fastapi==0.115.0
+uvicorn==0.30.0
+anthropic==0.39.0
+chromadb==0.5.23
+PyMuPDF==1.25.1
+jinja2==3.1.4
+python-multipart==0.0.12
