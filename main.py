@@ -1,1 +1,88 @@
-"""\nAgentic RAG Pipeline \u2014 FastAPI Server\nUpload documents, ask questions, watch the self-correcting pipeline work.\n"""\n\nfrom fastapi import FastAPI, Request, UploadFile, File\nfrom fastapi.responses import HTMLResponse, JSONResponse\nfrom fastapi.templating import Jinja2Templates\nfrom fastapi.middleware.cors import CORSMiddleware\nimport os\nimport uvicorn\n\nfrom app.agent import AgenticRAG\nfrom app.ingestion import ingest_text, ingest_pdf, get_doc_count, clear_documents\n\napp = FastAPI(title="Agentic RAG Pipeline", version="1.0.0")\napp.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])\ntemplates = Jinja2Templates(directory="templates")\nagent = None\n\ndef get_agent():\n    global agent\n    if agent is None: agent = AgenticRAG()\n    return agent\n\n@app.get("/", response_class=HTMLResponse)\nasync def home(request: Request):\n    return templates.TemplateResponse("index.html", {"request": request})\n\n@app.post("/api/upload/text")\nasync def upload_text(request: Request):\n    body = await request.json()\n    text = body.get("text", "").strip()\n    source = body.get("source", "pasted_text")\n    if not text: return JSONResponse({"error": "Text is required"}, status_code=400)\n    result = ingest_text(text, source=source)\n    result["total_docs_in_store"] = get_doc_count()\n    return JSONResponse(result)\n\n@app.post("/api/upload/pdf")\nasync def upload_pdf(file: UploadFile = File(...)):\n    if not file.filename.lower().endswith(".pdf"): return JSONResponse({"error": "Only PDF files supported"}, status_code=400)\n    content = await file.read()\n    result = ingest_pdf(content, filename=file.filename)\n    result["total_docs_in_store"] = get_doc_count()\n    return JSONResponse(result)\n\n@app.post("/api/query")\nasync def query(request: Request):\n    try:\n        body = await request.json()\n        question = body.get("question", "").strip()\n        if not question: return JSONResponse({"error": "Question is required"}, status_code=400)\n        if get_doc_count() == 0: return JSONResponse({"error": "No documents uploaded yet."}, status_code=400)\n        result = await get_agent().query(question)\n        return JSONResponse(result)\n    except ValueError as e: return JSONResponse({"error": str(e)}, status_code=500)\n    except Exception as e: return JSONResponse({"error": f"Query failed: {str(e)}"}, status_code=500)\n\n@app.post("/api/clear")\nasync def clear(): return JSONResponse(clear_documents())\n\n@app.get("/api/health")\nasync def health():\n    return {"status": "healthy", "api_key_set": bool(os.getenv("ANTHROPIC_API_KEY")), "documents_in_store": get_doc_count()}\n\nif __name__ == "__main__":\n    uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), reload=True)\n
+"""
+Agentic RAG Pipeline — FastAPI Server
+Upload documents, ask questions, watch the self-correcting pipeline work.
+"""
+
+from fastapi import FastAPI, Request, UploadFile, File
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.templating import Jinja2Templates
+from fastapi.middleware.cors import CORSMiddleware
+import os
+import uvicorn
+
+from app.agent import AgenticRAG
+from app.ingestion import ingest_text, ingest_pdf, get_doc_count, clear_documents
+
+app = FastAPI(title="Agentic RAG Pipeline", version="1.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+templates = Jinja2Templates(directory="templates")
+agent = None
+
+
+def get_agent():
+    global agent
+    if agent is None:
+        agent = AgenticRAG()
+    return agent
+
+
+@app.get("/", response_class=HTMLResponse)
+async def home(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
+
+
+@app.post("/api/upload/text")
+async def upload_text(request: Request):
+    body = await request.json()
+    text = body.get("text", "").strip()
+    source = body.get("source", "pasted_text")
+    if not text:
+        return JSONResponse({"error": "Text is required"}, status_code=400)
+    result = ingest_text(text, source=source)
+    result["total_docs_in_store"] = get_doc_count()
+    return JSONResponse(result)
+
+
+@app.post("/api/upload/pdf")
+async def upload_pdf(file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(".pdf"):
+        return JSONResponse({"error": "Only PDF files supported"}, status_code=400)
+    content = await file.read()
+    result = ingest_pdf(content, filename=file.filename)
+    result["total_docs_in_store"] = get_doc_count()
+    return JSONResponse(result)
+
+
+@app.post("/api/query")
+async def query(request: Request):
+    try:
+        body = await request.json()
+        question = body.get("question", "").strip()
+        if not question:
+            return JSONResponse({"error": "Question is required"}, status_code=400)
+        if get_doc_count() == 0:
+            return JSONResponse({"error": "No documents uploaded yet."}, status_code=400)
+        result = await get_agent().query(question)
+        return JSONResponse(result)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+    except Exception as e:
+        return JSONResponse({"error": f"Query failed: {str(e)}"}, status_code=500)
+
+
+@app.post("/api/clear")
+async def clear():
+    return JSONResponse(clear_documents())
+
+
+@app.get("/api/health")
+async def health():
+    return {
+        "status": "healthy",
+        "api_key_set": bool(os.getenv("ANTHROPIC_API_KEY")),
+        "documents_in_store": get_doc_count()
+    }
+
+
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), reload=True)
