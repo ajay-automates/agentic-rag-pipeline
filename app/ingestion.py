@@ -1,1 +1,108 @@
-"""\nAgentic RAG Pipeline \u2014 Document Ingestion\nHandles PDF/text upload, chunking, embedding, and storage in ChromaDB.\n"""\n\nimport chromadb\nfrom chromadb.utils import embedding_functions\nimport hashlib\nimport re\nfrom typing import Optional\n\nef = embedding_functions.DefaultEmbeddingFunction()\n\nclient = chromadb.Client()\ncollection = client.get_or_create_collection(\n    name="documents",\n    embedding_function=ef,\n    metadata={"hnsw:space": "cosine"}\n)\n\n\ndef chunk_text(text: str, chunk_size: int = 500, overlap: int = 100) -> list[dict]:\n    """Split text into overlapping chunks for better retrieval."""\n    text = re.sub(r'\\s+', ' ', text).strip()\n    words = text.split()\n    chunks = []\n    start = 0\n    while start < len(words):\n        end = start + chunk_size\n        chunk_words = words[start:end]\n        chunk_text = " ".join(chunk_words)\n        if len(chunk_text.strip()) > 50:\n            chunks.append({\n                "text": chunk_text,\n                "start_word": start,\n                "end_word": min(end, len(words)),\n                "chunk_id": hashlib.md5(chunk_text[:100].encode()).hexdigest()[:12]\n            })\n        start += chunk_size - overlap\n    return chunks\n\n\ndef ingest_text(text: str, source: str = "uploaded_document") -> dict:\n    """Ingest raw text into ChromaDB."""\n    chunks = chunk_text(text)\n    if not chunks:\n        return {"error": "No valid chunks created from text", "chunks": 0}\n    ids = [f"{source}_{c['chunk_id']}" for c in chunks]\n    documents = [c["text"] for c in chunks]\n    metadatas = [{"source": source, "chunk_index": i} for i, c in enumerate(chunks)]\n    collection.add(ids=ids, documents=documents, metadatas=metadatas)\n    return {"source": source, "total_chunks": len(chunks), "total_characters": sum(len(d) for d in documents), "status": "ingested"}\n\n\ndef ingest_pdf(pdf_bytes: bytes, filename: str) -> dict:\n    """Extract text from PDF and ingest into ChromaDB."""\n    try:\n        import fitz\n        doc = fitz.open(stream=pdf_bytes, filetype="pdf")\n        text = ""\n        for page in doc:\n            text += page.get_text() + "\\n"\n        doc.close()\n        if len(text.strip()) < 50:\n            return {"error": "PDF appears to be empty or image-only"}\n        return ingest_text(text, source=filename)\n    except ImportError:\n        return {"error": "PyMuPDF not installed. Run: pip install PyMuPDF"}\n    except Exception as e:\n        return {"error": f"PDF extraction failed: {str(e)}"}\n\n\ndef search(query: str, n_results: int = 5) -> list[dict]:\n    """Retrieve relevant document chunks for a query."""\n    results = collection.query(query_texts=[query], n_results=n_results, include=["documents", "metadatas", "distances"])\n    retrieved = []\n    if results and results["documents"]:\n        for doc, meta, dist in zip(results["documents"][0], results["metadatas"][0], results["distances"][0]):\n            retrieved.append({"text": doc, "source": meta.get("source", "unknown"), "relevance_score": round(1 - dist, 4)})\n    return retrieved\n\n\ndef get_doc_count() -> int:\n    return collection.count()\n\n\ndef clear_documents():\n    global collection\n    client.delete_collection("documents")\n    collection = client.get_or_create_collection(name="documents", embedding_function=ef, metadata={"hnsw:space": "cosine"})\n    return {"status": "cleared"}\n
+"""
+Agentic RAG Pipeline - Document Ingestion
+Handles PDF/text upload, chunking, embedding, and storage in ChromaDB.
+"""
+
+import chromadb
+from chromadb.utils import embedding_functions
+import hashlib
+import re
+from typing import Optional
+
+ef = embedding_functions.DefaultEmbeddingFunction()
+
+client = chromadb.Client()
+collection = client.get_or_create_collection(
+    name="documents",
+    embedding_function=ef,
+    metadata={"hnsw:space": "cosine"}
+)
+
+
+def chunk_text(text, chunk_size=500, overlap=100):
+    """Split text into overlapping chunks for better retrieval."""
+    text = re.sub(r'\s+', ' ', text).strip()
+    words = text.split()
+    chunks = []
+    start = 0
+    while start < len(words):
+        end = start + chunk_size
+        chunk_words = words[start:end]
+        chunk_text_str = " ".join(chunk_words)
+        if len(chunk_text_str.strip()) > 50:
+            chunks.append({
+                "text": chunk_text_str,
+                "start_word": start,
+                "end_word": min(end, len(words)),
+                "chunk_id": hashlib.md5(chunk_text_str[:100].encode()).hexdigest()[:12]
+            })
+        start += chunk_size - overlap
+    return chunks
+
+
+def ingest_text(text, source="uploaded_document"):
+    """Ingest raw text into ChromaDB."""
+    chunks = chunk_text(text)
+    if not chunks:
+        return {"error": "No valid chunks created from text", "chunks": 0}
+    ids = [f"{source}_{c['chunk_id']}" for c in chunks]
+    documents = [c["text"] for c in chunks]
+    metadatas = [{"source": source, "chunk_index": i} for i, c in enumerate(chunks)]
+    collection.add(ids=ids, documents=documents, metadatas=metadatas)
+    return {
+        "source": source,
+        "total_chunks": len(chunks),
+        "total_characters": sum(len(d) for d in documents),
+        "status": "ingested"
+    }
+
+
+def ingest_pdf(pdf_bytes, filename):
+    """Extract text from PDF and ingest into ChromaDB."""
+    try:
+        import fitz
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        text = ""
+        for page in doc:
+            text += page.get_text() + "\n"
+        doc.close()
+        if len(text.strip()) < 50:
+            return {"error": "PDF appears to be empty or image-only"}
+        return ingest_text(text, source=filename)
+    except ImportError:
+        return {"error": "PyMuPDF not installed. Run: pip install PyMuPDF"}
+    except Exception as e:
+        return {"error": f"PDF extraction failed: {str(e)}"}
+
+
+def search(query, n_results=5):
+    """Retrieve relevant document chunks for a query."""
+    results = collection.query(
+        query_texts=[query],
+        n_results=n_results,
+        include=["documents", "metadatas", "distances"]
+    )
+    retrieved = []
+    if results and results["documents"]:
+        for doc, meta, dist in zip(results["documents"][0], results["metadatas"][0], results["distances"][0]):
+            retrieved.append({
+                "text": doc,
+                "source": meta.get("source", "unknown"),
+                "relevance_score": round(1 - dist, 4)
+            })
+    return retrieved
+
+
+def get_doc_count():
+    return collection.count()
+
+
+def clear_documents():
+    global collection
+    client.delete_collection("documents")
+    collection = client.get_or_create_collection(
+        name="documents",
+        embedding_function=ef,
+        metadata={"hnsw:space": "cosine"}
+    )
+    return {"status": "cleared"}
