@@ -1,1 +1,195 @@
-"""\nAgentic RAG Pipeline \u2014 Self-Correcting Retrieval Agent\n\nPipeline:\n1. Retrieve \u2192 Get relevant chunks from vector store\n2. Grade \u2192 Claude evaluates if retrieved docs actually answer the question\n3. Decide \u2192 If relevant: generate. If not: reformulate query and re-retrieve\n4. Generate \u2192 Produce answer with citations\n5. Hallucination Check \u2192 Verify answer is grounded in retrieved docs\n"""\n\nimport anthropic\nimport json\nimport os\nimport time\nfrom typing import Optional\nfrom .ingestion import search\n\nGRADER_PROMPT = """You are a retrieval grader. Assess whether a retrieved document is relevant to the question.\n\nRetrieved document:\n{document}\n\nUser question:\n{question}\n\nRespond with ONLY a JSON object:\n{{\"relevance\": \"relevant|partially_relevant|not_relevant\", \"reason\": \"one sentence\"}}"""\n\nREFORMULATOR_PROMPT = """The original query didn't retrieve good results. Generate a better search query.\n\nOriginal question: {question}\n\nRespond with ONLY the reformulated query text."""\n\nGENERATOR_PROMPT = """Answer the question using ONLY the provided context documents.\n\nRULES:\n1. Only use information from the provided context\n2. If the context doesn't contain enough info, say so\n3. Cite sources using [Source: filename]\n4. Be specific with numbers and details from documents\n\nContext documents:\n{context}\n\nQuestion: {question}"""\n\nHALLUCINATION_CHECK_PROMPT = """Check if the answer is fully supported by the source documents.\n\nSource documents:\n{context}\n\nGenerated answer:\n{answer}\n\nRespond with ONLY a JSON object:\n{{\"grounded\": true/false, \"confidence\": 0.0-1.0, \"issues\": [\"list of unsupported claims or empty\"]}}"""\n\n\nclass AgenticRAG:\n    def __init__(self):\n        api_key = os.getenv("ANTHROPIC_API_KEY")\n        if not api_key:\n            raise ValueError("ANTHROPIC_API_KEY environment variable is required")\n        self.client = anthropic.Anthropic(api_key=api_key)\n        self.model = "claude-sonnet-4-20250514"\n\n    def _call_claude(self, prompt: str, max_tokens: int = 1024) -> str:\n        response = self.client.messages.create(model=self.model, max_tokens=max_tokens, messages=[{"role": "user", "content": prompt}])\n        return response.content[0].text\n\n    def _grade_documents(self, question: str, documents: list[dict]) -> list[dict]:\n        graded = []\n        for doc in documents:\n            prompt = GRADER_PROMPT.format(document=doc["text"][:1000], question=question)\n            try:\n                result = self._call_claude(prompt, max_tokens=200).strip()\n                if result.startswith("```"): result = result.split("```")[1].replace("json", "").strip()\n                grade = json.loads(result)\n                doc["grade"] = grade.get("relevance", "not_relevant")\n                doc["grade_reason"] = grade.get("reason", "")\n            except (json.JSONDecodeError, Exception):\n                doc["grade"] = "partially_relevant"\n                doc["grade_reason"] = "Grading inconclusive"\n            graded.append(doc)\n        return graded\n\n    def _reformulate_query(self, question: str) -> str:\n        return self._call_claude(REFORMULATOR_PROMPT.format(question=question), max_tokens=100).strip()\n\n    def _generate_answer(self, question: str, context_docs: list[dict]) -> str:\n        context = "\\n\\n---\\n\\n".join([f"[Source: {d['source']}] (Relevance: {d.get('relevance_score', 'N/A')})\\n{d['text']}" for d in context_docs])\n        return self._call_claude(GENERATOR_PROMPT.format(context=context, question=question), max_tokens=2048)\n\n    def _check_hallucination(self, answer: str, context_docs: list[dict]) -> dict:\n        context = "\\n\\n".join([f"[{d['source']}]: {d['text']}" for d in context_docs])\n        try:\n            result = self._call_claude(HALLUCINATION_CHECK_PROMPT.format(context=context[:4000], answer=answer), max_tokens=300).strip()\n            if result.startswith("```"): result = result.split("```")[1].replace("json", "").strip()\n            return json.loads(result)\n        except (json.JSONDecodeError, Exception):\n            return {"grounded": True, "confidence": 0.5, "issues": ["Check inconclusive"]}\n\n    async def query(self, question: str, max_retries: int = 2) -> dict:\n        start_time = time.time()\n        pipeline_trace = []\n        current_query = question\n        attempt = 0\n        relevant_docs = []\n\n        while attempt <= max_retries:\n            attempt += 1\n            step_name = f"Attempt {attempt}" + (" (reformulated)" if attempt > 1 else "")\n\n            retrieved = search(current_query, n_results=5)\n            pipeline_trace.append({"step": f"{step_name} \u2014 Retrieve", "query": current_query, "docs_retrieved": len(retrieved), "top_scores": [d["relevance_score"] for d in retrieved[:3]]})\n\n            if not retrieved:\n                pipeline_trace.append({"step": f"{step_name} \u2014 No Results", "action": "No documents in vector store"})\n                break\n\n            graded = self._grade_documents(question, retrieved)\n            relevant = [d for d in graded if d["grade"] in ("relevant", "partially_relevant")]\n            not_relevant = [d for d in graded if d["grade"] == "not_relevant"]\n            pipeline_trace.append({"step": f"{step_name} \u2014 Grade", "relevant": len(relevant), "not_relevant": len(not_relevant), "grades": [{"source": d["source"][:30], "grade": d["grade"]} for d in graded]})\n\n            if len(relevant) >= 2 or (len(relevant) >= 1 and attempt > 1):\n                relevant_docs = relevant\n                pipeline_trace.append({"step": f"{step_name} \u2014 Decision", "action": "Sufficient relevant docs. Generating answer.", "docs_used": len(relevant)})\n                break\n            elif attempt <= max_retries:\n                new_query = self._reformulate_query(current_query)\n                pipeline_trace.append({"step": f"{step_name} \u2014 Reformulate", "original": current_query, "reformulated": new_query})\n                current_query = new_query\n            else:\n                relevant_docs = relevant if relevant else retrieved[:3]\n                pipeline_trace.append({"step": f"{step_name} \u2014 Decision", "action": "Max retries. Using best available.", "docs_used": len(relevant_docs)})\n\n        if not relevant_docs:\n            answer = "I don't have relevant documents to answer this. Please upload documents first."\n            hallucination_check = {"grounded": True, "confidence": 1.0, "issues": []}\n        else:\n            answer = self._generate_answer(question, relevant_docs)\n            pipeline_trace.append({"step": "Generate Answer", "docs_used": len(relevant_docs), "answer_length": len(answer)})\n            hallucination_check = self._check_hallucination(answer, relevant_docs)\n            pipeline_trace.append({"step": "Hallucination Check", "grounded": hallucination_check.get("grounded", False), "confidence": hallucination_check.get("confidence", 0), "issues": hallucination_check.get("issues", [])})\n\n        elapsed = round(time.time() - start_time, 2)\n        return {\n            "answer": answer, "question": question, "pipeline_trace": pipeline_trace,\n            "sources": [{"source": d["source"], "relevance": d.get("relevance_score", 0), "grade": d.get("grade", "N/A")} for d in relevant_docs],\n            "hallucination_check": hallucination_check,\n            "metrics": {\n                "retrieval_attempts": attempt, "docs_used_for_answer": len(relevant_docs),\n                "query_reformulated": attempt > 1, "answer_grounded": hallucination_check.get("grounded", False),\n                "grounding_confidence": hallucination_check.get("confidence", 0), "latency_seconds": elapsed\n            }\n        }\n
+"""
+Agentic RAG Pipeline - Self-Correcting Retrieval Agent
+
+Pipeline:
+1. Retrieve - Get relevant chunks from vector store
+2. Grade - Claude evaluates if retrieved docs actually answer the question
+3. Decide - If relevant: generate. If not: reformulate query and re-retrieve
+4. Generate - Produce answer with citations
+5. Hallucination Check - Verify answer is grounded in retrieved docs
+"""
+
+import anthropic
+import json
+import os
+import time
+from typing import Optional
+from .ingestion import search
+
+
+GRADER_PROMPT = """You are a retrieval grader. Assess whether a retrieved document is relevant to the question.
+
+Retrieved document:
+{document}
+
+User question:
+{question}
+
+Respond with ONLY a JSON object:
+{{"relevance": "relevant|partially_relevant|not_relevant", "reason": "one sentence"}}"""
+
+
+REFORMULATOR_PROMPT = """The original query didn't retrieve good results. Generate a better search query.
+
+Original question: {question}
+
+Respond with ONLY the reformulated query text."""
+
+
+GENERATOR_PROMPT = """Answer the question using ONLY the provided context documents.
+
+RULES:
+1. Only use information from the provided context
+2. If the context doesn't contain enough info, say so
+3. Cite sources using [Source: filename]
+4. Be specific with numbers and details from documents
+
+Context documents:
+{context}
+
+Question: {question}"""
+
+
+HALLUCINATION_CHECK_PROMPT = """Check if the answer is fully supported by the source documents.
+
+Source documents:
+{context}
+
+Generated answer:
+{answer}
+
+Respond with ONLY a JSON object:
+{{"grounded": true, "confidence": 0.9, "issues": []}}"""
+
+
+class AgenticRAG:
+    def __init__(self):
+        api_key = os.getenv("ANTHROPIC_API_KEY")
+        if not api_key:
+            raise ValueError("ANTHROPIC_API_KEY environment variable is required")
+        self.client = anthropic.Anthropic(api_key=api_key)
+        self.model = "claude-sonnet-4-20250514"
+
+    def _call_claude(self, prompt, max_tokens=1024):
+        response = self.client.messages.create(
+            model=self.model,
+            max_tokens=max_tokens,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response.content[0].text
+
+    def _grade_documents(self, question, documents):
+        graded = []
+        for doc in documents:
+            prompt = GRADER_PROMPT.format(document=doc["text"][:1000], question=question)
+            try:
+                result = self._call_claude(prompt, max_tokens=200).strip()
+                if result.startswith("```"):
+                    result = result.split("```")[1].replace("json", "").strip()
+                grade = json.loads(result)
+                doc["grade"] = grade.get("relevance", "not_relevant")
+                doc["grade_reason"] = grade.get("reason", "")
+            except Exception:
+                doc["grade"] = "partially_relevant"
+                doc["grade_reason"] = "Grading inconclusive"
+            graded.append(doc)
+        return graded
+
+    def _reformulate_query(self, question):
+        return self._call_claude(REFORMULATOR_PROMPT.format(question=question), max_tokens=100).strip()
+
+    def _generate_answer(self, question, context_docs):
+        context = "\n\n---\n\n".join([
+            f"[Source: {d['source']}] (Relevance: {d.get('relevance_score', 'N/A')})\n{d['text']}"
+            for d in context_docs
+        ])
+        return self._call_claude(GENERATOR_PROMPT.format(context=context, question=question), max_tokens=2048)
+
+    def _check_hallucination(self, answer, context_docs):
+        context = "\n\n".join([f"[{d['source']}]: {d['text']}" for d in context_docs])
+        try:
+            result = self._call_claude(
+                HALLUCINATION_CHECK_PROMPT.format(context=context[:4000], answer=answer),
+                max_tokens=300
+            ).strip()
+            if result.startswith("```"):
+                result = result.split("```")[1].replace("json", "").strip()
+            return json.loads(result)
+        except Exception:
+            return {"grounded": True, "confidence": 0.5, "issues": ["Check inconclusive"]}
+
+    async def query(self, question, max_retries=2):
+        start_time = time.time()
+        pipeline_trace = []
+        current_query = question
+        attempt = 0
+        relevant_docs = []
+
+        while attempt <= max_retries:
+            attempt += 1
+            step_name = f"Attempt {attempt}" + (" (reformulated)" if attempt > 1 else "")
+
+            retrieved = search(current_query, n_results=5)
+            pipeline_trace.append({
+                "step": f"{step_name} - Retrieve",
+                "query": current_query,
+                "docs_retrieved": len(retrieved),
+                "top_scores": [d["relevance_score"] for d in retrieved[:3]]
+            })
+
+            if not retrieved:
+                pipeline_trace.append({"step": f"{step_name} - No Results", "action": "No documents in vector store"})
+                break
+
+            graded = self._grade_documents(question, retrieved)
+            relevant = [d for d in graded if d["grade"] in ("relevant", "partially_relevant")]
+            not_relevant = [d for d in graded if d["grade"] == "not_relevant"]
+            pipeline_trace.append({
+                "step": f"{step_name} - Grade",
+                "relevant": len(relevant),
+                "not_relevant": len(not_relevant),
+                "grades": [{"source": d["source"][:30], "grade": d["grade"]} for d in graded]
+            })
+
+            if len(relevant) >= 2 or (len(relevant) >= 1 and attempt > 1):
+                relevant_docs = relevant
+                pipeline_trace.append({"step": f"{step_name} - Decision", "action": "Sufficient relevant docs.", "docs_used": len(relevant)})
+                break
+            elif attempt <= max_retries:
+                new_query = self._reformulate_query(current_query)
+                pipeline_trace.append({"step": f"{step_name} - Reformulate", "original": current_query, "reformulated": new_query})
+                current_query = new_query
+            else:
+                relevant_docs = relevant if relevant else retrieved[:3]
+                pipeline_trace.append({"step": f"{step_name} - Decision", "action": "Max retries. Using best available.", "docs_used": len(relevant_docs)})
+
+        if not relevant_docs:
+            answer = "I don't have relevant documents to answer this. Please upload documents first."
+            hallucination_check = {"grounded": True, "confidence": 1.0, "issues": []}
+        else:
+            answer = self._generate_answer(question, relevant_docs)
+            pipeline_trace.append({"step": "Generate Answer", "docs_used": len(relevant_docs), "answer_length": len(answer)})
+            hallucination_check = self._check_hallucination(answer, relevant_docs)
+            pipeline_trace.append({
+                "step": "Hallucination Check",
+                "grounded": hallucination_check.get("grounded", False),
+                "confidence": hallucination_check.get("confidence", 0),
+                "issues": hallucination_check.get("issues", [])
+            })
+
+        elapsed = round(time.time() - start_time, 2)
+        return {
+            "answer": answer,
+            "question": question,
+            "pipeline_trace": pipeline_trace,
+            "sources": [{"source": d["source"], "relevance": d.get("relevance_score", 0), "grade": d.get("grade", "N/A")} for d in relevant_docs],
+            "hallucination_check": hallucination_check,
+            "metrics": {
+                "retrieval_attempts": attempt,
+                "docs_used_for_answer": len(relevant_docs),
+                "query_reformulated": attempt > 1,
+                "answer_grounded": hallucination_check.get("grounded", False),
+                "grounding_confidence": hallucination_check.get("confidence", 0),
+                "latency_seconds": elapsed
+            }
+        }
