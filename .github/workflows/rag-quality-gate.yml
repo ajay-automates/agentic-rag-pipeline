@@ -1,0 +1,75 @@
+name: RAG Quality Gate
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'app/**'
+      - 'eval/**'
+      - 'requirements.txt'
+  workflow_dispatch:
+
+env:
+  ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+jobs:
+  rag-evaluation:
+    name: RAG Quality Evaluation
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run RAG evaluation (quick)
+        run: |
+          echo "Running RAG quality evaluation..."
+          echo "================================="
+          python eval/evaluate.py --quick --save
+
+      - name: Upload evaluation results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-results-${{ github.sha }}
+          path: eval/results/
+          retention-days: 30
+
+      - name: Comment PR with results
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const resultsDir = 'eval/results';
+            let summary = null;
+            if (fs.existsSync(resultsDir)) {
+              const files = fs.readdirSync(resultsDir).filter(f => f.startsWith('eval_summary_')).sort().reverse();
+              if (files.length > 0) {
+                summary = JSON.parse(fs.readFileSync(path.join(resultsDir, files[0]), 'utf8'));
+              }
+            }
+            let body;
+            if (summary) {
+              const verdict = summary.verdict === 'PASS' ? '✅ PASS' : '❌ FAIL';
+              body = `## RAG Quality Gate ${verdict}\n\n| Metric | Score | Threshold | Status |\n|--------|-------|-----------|--------|\n| Faithfulness | ${(summary.metrics.faithfulness * 100).toFixed(1)}% | ${(summary.thresholds.faithfulness_min * 100).toFixed(0)}% | ${summary.metrics.faithfulness >= summary.thresholds.faithfulness_min ? '✅' : '❌'} |\n| Answer Relevancy | ${(summary.metrics.relevancy * 100).toFixed(1)}% | ${(summary.thresholds.answer_relevancy_min * 100).toFixed(0)}% | ${summary.metrics.relevancy >= summary.thresholds.answer_relevancy_min ? '✅' : '❌'} |\n| Citation Coverage | ${(summary.metrics.citation_coverage * 100).toFixed(1)}% | ${(summary.thresholds.citation_coverage_min * 100).toFixed(0)}% | ${summary.metrics.citation_coverage >= summary.thresholds.citation_coverage_min ? '✅' : '❌'} |\n| Refusal Accuracy | ${(summary.metrics.refusal_accuracy * 100).toFixed(1)}% | ${(summary.thresholds.refusal_accuracy_min * 100).toFixed(0)}% | ${summary.metrics.refusal_accuracy >= summary.thresholds.refusal_accuracy_min ? '✅' : '❌'} |\n| Fact Recall | ${(summary.metrics.fact_recall * 100).toFixed(1)}% | 70% | ${summary.metrics.fact_recall >= 0.70 ? '✅' : '❌'} |\n\n**Avg Latency:** ${summary.metrics.avg_latency}s per question\n**Questions Evaluated:** ${summary.total_questions}`;
+            } else {
+              body = '## RAG Quality Gate\n\n⚠️ Evaluation results not found. Check the workflow logs.';
+            }
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
