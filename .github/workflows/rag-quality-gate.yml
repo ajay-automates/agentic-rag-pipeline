@@ -63,13 +63,8 @@ jobs:
             let body;
             if (summary) {
               const verdict = summary.verdict === 'PASS' ? '✅ PASS' : '❌ FAIL';
-              body = `## RAG Quality Gate ${verdict}\n\n| Metric | Score | Threshold | Status |\n|--------|-------|-----------|--------|\n| Faithfulness | ${(summary.metrics.faithfulness * 100).toFixed(1)}% | ${(summary.thresholds.faithfulness_min * 100).toFixed(0)}% | ${summary.metrics.faithfulness >= summary.thresholds.faithfulness_min ? '✅' : '❌'} |\n| Answer Relevancy | ${(summary.metrics.relevancy * 100).toFixed(1)}% | ${(summary.thresholds.answer_relevancy_min * 100).toFixed(0)}% | ${summary.metrics.relevancy >= summary.thresholds.answer_relevancy_min ? '✅' : '❌'} |\n| Citation Coverage | ${(summary.metrics.citation_coverage * 100).toFixed(1)}% | ${(summary.thresholds.citation_coverage_min * 100).toFixed(0)}% | ${summary.metrics.citation_coverage >= summary.thresholds.citation_coverage_min ? '✅' : '❌'} |\n| Refusal Accuracy | ${(summary.metrics.refusal_accuracy * 100).toFixed(1)}% | ${(summary.thresholds.refusal_accuracy_min * 100).toFixed(0)}% | ${summary.metrics.refusal_accuracy >= summary.thresholds.refusal_accuracy_min ? '✅' : '❌'} |\n| Fact Recall | ${(summary.metrics.fact_recall * 100).toFixed(1)}% | 70% | ${summary.metrics.fact_recall >= 0.70 ? '✅' : '❌'} |\n\n**Avg Latency:** ${summary.metrics.avg_latency}s per question\n**Questions Evaluated:** ${summary.total_questions}`;
+              body = `## RAG Quality Gate ${verdict}\n\n| Metric | Score | Threshold | Status |\n|--------|-------|-----------|--------|\n| Faithfulness | ${(summary.metrics.faithfulness * 100).toFixed(1)}% | ${(summary.thresholds.faithfulness_min * 100).toFixed(0)}% | ${summary.metrics.faithfulness >= summary.thresholds.faithfulness_min ? '✅' : '❌'} |\n| Answer Relevancy | ${(summary.metrics.relevancy * 100).toFixed(1)}% | ${(summary.thresholds.answer_relevancy_min * 100).toFixed(0)}% | ${summary.metrics.relevancy >= summary.thresholds.answer_relevancy_min ? '✅' : '❌'} |\n| Citation Coverage | ${(summary.metrics.citation_coverage * 100).toFixed(1)}% | ${(summary.thresholds.citation_coverage_min * 100).toFixed(0)}% | ${summary.metrics.citation_coverage >= summary.thresholds.citation_coverage_min ? '✅' : '❌'} |\n| Refusal Accuracy | ${(summary.metrics.refusal_accuracy * 100).toFixed(1)}% | ${(summary.thresholds.refusal_accuracy_min * 100).toFixed(0)}% | ${summary.metrics.refusal_accuracy >= summary.thresholds.refusal_accuracy_min ? '✅' : '❌'} |\n| Fact Recall | ${(summary.metrics.fact_recall * 100).toFixed(1)}% | 70% | ${summary.metrics.fact_recall >= 0.70 ? '✅' : '❌'} |\n\n**Avg Latency:** ${summary.metrics.avg_latency}s\n**Questions Evaluated:** ${summary.total_questions}`;
             } else {
-              body = '## RAG Quality Gate\n\n⚠️ Evaluation results not found. Check the workflow logs.';
+              body = '## RAG Quality Gate\n\n⚠️ Results not found.';
             }
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: body
-            });
+            github.rest.issues.createComment({ issue_number: context.issue.number, owner: context.repo.owner, repo: context.repo.repo, body });
